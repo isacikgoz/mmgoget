@@ -6,13 +6,17 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 
 	"github.com/google/go-github/v45/github"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
 var (
 	rg = regexp.MustCompile(`github\.com\/(.[^\/]+)/(.[^\/]+)/(v\d+)@(.+)`)
+
+	commentFlag bool
 
 	rootCmd = &cobra.Command{
 		Use:   "mmgoget",
@@ -23,6 +27,8 @@ var (
 )
 
 func main() {
+	rootCmd.PersistentFlags().BoolVar(&commentFlag, "comment", false, "Places a comment above the require statement to show what project version the commit sha is pointing to.")
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -50,6 +56,13 @@ func RootCmdF(cmd *cobra.Command, args []string) error {
 
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("error while running command %q: %s", "go get", err)
+	}
+
+	if commentFlag {
+		err := AddComment(args[0])
+		if err != nil {
+			return errors.Wrap(err, "error adding comment to go.mod")
+		}
 	}
 
 	return nil
@@ -80,4 +93,37 @@ func GetSHA(owner, repo, tag string) (string, error) {
 	}
 
 	return sha, nil
+}
+
+func AddComment(module string) error {
+	parts := strings.Split(module, "@")
+	if len(parts) != 2 {
+		return errors.New("failed to parse version from module")
+	}
+	name, version := parts[0], parts[1]
+	version = strings.TrimLeft(version, "v")
+
+	b, err := os.ReadFile("go.mod")
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+
+	out := []string{}
+	for i, line := range lines {
+		if !strings.Contains(line, name) {
+			out = append(out, line)
+			continue
+		}
+
+		if strings.HasPrefix(strings.Trim(out[i-1], "\t"), "//") {
+			out = out[:i-1]
+		}
+
+		comment := "\t// " + version
+		out = append(out, comment, line)
+	}
+
+	outBytes := []byte(strings.Join(out, "\n"))
+	return os.WriteFile("go.mod", outBytes, 0777)
 }
