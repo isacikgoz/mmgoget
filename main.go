@@ -3,15 +3,24 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 
 	"github.com/google/go-github/v45/github"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/modfile"
 )
+
+type Module struct {
+	Owner   string
+	Project string
+	Version string
+	Tag     string
+	SHA     string
+}
 
 var (
 	rg = regexp.MustCompile(`github\.com\/(.[^\/]+)/(.[^\/]+)/(v\d+)@(.+)`)
@@ -40,17 +49,18 @@ func RootCmdF(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("format must be github.com/<org>/<repo>/<module_version>@<tag>")
 	}
 
-	ss := rg.FindAllStringSubmatch(args[0], -1)
-	if len(ss) < 1 || len(ss[0]) < 5 {
-		return fmt.Errorf("format must be github.com/<org>/<repo>/<module_version>@<tag>")
+	mod, err := NewModule(args[0])
+	if err != nil {
+		return fmt.Errorf("failed to parse module: %v", err)
 	}
 
-	sha, err := GetSHA(ss[0][1], ss[0][2], ss[0][4])
+	sha, err := GetSHA(mod)
 	if err != nil {
 		return fmt.Errorf("failed to get sha: %v", err)
 	}
+	mod.SHA = sha
 
-	c := exec.Command("go", "get", fmt.Sprintf("github.com/%s/%s/%s@%s", ss[0][1], ss[0][2], ss[0][3], sha))
+	c := exec.Command("go", "get", fmt.Sprintf("%s@%s", mod.Path(), mod.SHA))
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 
@@ -59,28 +69,28 @@ func RootCmdF(cmd *cobra.Command, args []string) error {
 	}
 
 	if commentFlag {
-		err := AddComment(args[0])
+		err := AddComment(mod)
 		if err != nil {
-			return errors.Wrap(err, "error adding comment to go.mod")
+			return fmt.Errorf("error adding comment to go.mod: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func GetSHA(owner, repo, tag string) (string, error) {
+func GetSHA(mod *Module) (string, error) {
 	client := github.NewClient(nil)
 
 	opt := &github.ListOptions{
 		PerPage: 200,
 	}
-	tags, _, err := client.Repositories.ListTags(context.Background(), owner, repo, opt)
+	tags, _, err := client.Repositories.ListTags(context.Background(), mod.Owner, mod.Project, opt)
 	if err != nil {
 		return "", err
 	}
 	var sha string
 	for _, t := range tags {
-		if t.GetName() == tag {
+		if t.GetName() == mod.Tag {
 			sha = t.GetCommit().GetSHA()
 			sha = sha[:10]
 			break
@@ -89,41 +99,70 @@ func GetSHA(owner, repo, tag string) (string, error) {
 	if sha == "" {
 		// leap of faith, maybe we can find with the tag
 		// or the tag value is sha already
-		sha = tag
+		sha = mod.Tag
 	}
 
 	return sha, nil
 }
 
-func AddComment(module string) error {
-	parts := strings.Split(module, "@")
-	if len(parts) != 2 {
-		return errors.New("failed to parse version from module")
+func AddComment(mod *Module) error {
+	var b []byte
+	var err error
+	if b, err = ioutil.ReadFile("go.mod"); err != nil {
+		return fmt.Errorf("failed to read go.mod: %v", err)
 	}
-	name, version := parts[0], parts[1]
-	version = strings.TrimLeft(version, "v")
 
-	b, err := os.ReadFile("go.mod")
+	mf, err := modfile.Parse("go.mod", b, nil)
 	if err != nil {
+		return fmt.Errorf("failed to parse go.mod: %v", err)
+	}
+
+	for _, require := range mf.Require {
+		if require.Mod.Path == mod.Path() {
+			// cleanup previous mmgoget comments
+			for i, c := range require.Syntax.Comments.Before {
+				if strings.HasPrefix(c.Token, "// mmgoget") {
+					require.Syntax.Comments.Before = append(require.Syntax.Comments.Before[:i], require.Syntax.Comments.Before[i+1:]...)
+				}
+			}
+
+			require.Syntax.Comments.Before = append(require.Syntax.Comments.Before, modfile.Comment{
+				Token: fmt.Sprintf("// mmgoget: %s@%s is replaced by -> %s@%s", mod.Path(), mod.Tag, mod.Path(), mod.SHA),
+			})
+		}
+	}
+
+	b1 := modfile.Format(mf.Syntax)
+	err = os.Rename("go.mod", "go.mod.bak")
+	if err != nil {
+		return fmt.Errorf("failed to backup go.mod: %v", err)
+	}
+	if err = os.WriteFile("go.mod", b1, 0644); err != nil {
+		_ = os.Rename("go.mod.bak", "go.mod")
 		return err
 	}
-	lines := strings.Split(string(b), "\n")
 
-	out := []string{}
-	for i, line := range lines {
-		if !strings.Contains(line, name) {
-			out = append(out, line)
-			continue
-		}
+	defer os.Remove("./go.mod.bak")
 
-		if strings.HasPrefix(strings.Trim(out[i-1], "\t"), "//") {
-			out = out[:i-1]
-		}
+	return nil
+}
 
-		comment := "\t// " + version
-		out = append(out, comment, line)
+func NewModule(mod string) (*Module, error) {
+	ss := rg.FindAllStringSubmatch(mod, -1)
+	if len(ss) < 1 || len(ss[0]) < 5 {
+		return nil, fmt.Errorf("format must be github.com/<org>/<repo>/<module_version>@<tag>")
 	}
 
-	outBytes := []byte(strings.Join(out, "\n"))
-	return os.WriteFile("go.mod", outBytes, 0777)
+	owner, project, version, tag := ss[0][1], ss[0][2], ss[0][3], ss[0][4]
+
+	return &Module{
+		Owner:   owner,
+		Project: project,
+		Version: version,
+		Tag:     tag,
+	}, nil
+}
+
+func (m *Module) Path() string {
+	return fmt.Sprintf("github.com/%s/%s/%s", m.Owner, m.Project, m.Version)
 }

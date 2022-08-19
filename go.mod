@@ -5,6 +5,7 @@ go 1.18
 require (
 	github.com/google/go-github/v45 v45.2.0
 	github.com/spf13/cobra v1.5.0
+	golang.org/x/mod v0.5.1
 )
 
 require (
@@ -12,4 +13,5 @@ require (
 	github.com/inconshreveable/mousetrap v1.0.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5 // indirect
+	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 // indirect
 )
